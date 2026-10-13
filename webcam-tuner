@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Webcam Tuner - adjust V4L2/UVC webcam controls with a live preview.
+
+Usage:
+  webcam-tuner                 open the GUI
+  webcam-tuner --apply         apply the saved profile and exit (no GUI)
+  webcam-tuner --save          save current camera settings as the profile
+  webcam-tuner --json          print controls as JSON (used by the Omarchy panel)
+  webcam-tuner -d /dev/videoN  use a different device
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+PROFILE_DIR = Path.home() / ".config" / "webcam-tuner"
+
+CTRL_RE = re.compile(r"^\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)$")
+MENU_RE = re.compile(r"^\s+(\d+):\s+(.*)$")
+
+# Controls that switch an automatic mode; applied first so the manual
+# values that depend on them are accepted.
+AUTO_CTRLS = ("auto_exposure", "white_balance_automatic",
+              "focus_automatic_continuous", "exposure_dynamic_framerate")
+
+
+PRETTY = {
+    "auto_exposure": "Exposure mode",
+    "exposure_time_absolute": "Exposure time",
+    "exposure_dynamic_framerate": "Lower framerate in low light",
+    "white_balance_automatic": "Auto white balance",
+    "white_balance_temperature": "White balance (K)",
+    "focus_automatic_continuous": "Autofocus",
+    "focus_absolute": "Focus",
+    "power_line_frequency": "Anti-flicker",
+    "backlight_compensation": "Backlight compensation",
+}
+GROUPS = [
+    ("Exposure", ["auto_exposure", "exposure_time_absolute", "gain",
+                  "exposure_dynamic_framerate", "backlight_compensation",
+                  "power_line_frequency"]),
+    ("Image", ["brightness", "contrast", "saturation", "sharpness"]),
+    ("White balance", ["white_balance_automatic", "white_balance_temperature"]),
+    ("Focus & framing", ["focus_automatic_continuous", "focus_absolute",
+                         "zoom_absolute", "pan_absolute", "tilt_absolute"]),
+]
+MENU_LABELS = {"Aperture Priority Mode": "Auto", "Manual Mode": "Manual"}
+
+
+def pretty_label(name):
+    return PRETTY.get(name, name.replace("_absolute", "").replace("_", " ").capitalize())
+
+
+def list_controls(device):
+    out = subprocess.run(["v4l2-ctl", "-d", device, "--list-ctrls-menus"],
+                         capture_output=True, text=True, check=True).stdout
+    ctrls, current = {}, None
+    for line in out.splitlines():
+        m = CTRL_RE.match(line)
+        if m:
+            name, typ, rest = m.groups()
+            attrs = dict(re.findall(r"(\w+)=(-?\w+)", rest))
+            current = {
+                "name": name, "type": typ,
+                "min": int(attrs.get("min", 0)), "max": int(attrs.get("max", 1)),
+                "step": int(attrs.get("step", 1)) or 1,
+                "default": int(attrs.get("default", 0)),
+                "value": int(attrs.get("value", 0)),
+                "inactive": "inactive" in rest.split("flags=")[-1] if "flags=" in rest else False,
+                "menu": {},
+            }
+            ctrls[name] = current
+            continue
+        m = MENU_RE.match(line)
+        if m and current and current["type"] == "menu":
+            current["menu"][int(m.group(1))] = m.group(2)
+    return ctrls
+
+
+def set_control(device, name, value):
+    r = subprocess.run(["v4l2-ctl", "-d", device, "-c", f"{name}={value}"],
+                       capture_output=True, text=True)
+    return r.returncode == 0, r.stderr.strip()
+
+
+def profile_path(device):
+    return PROFILE_DIR / f"{Path(device).name}.json"
+
+
+def apply_profile(device, values):
+    order = [k for k in AUTO_CTRLS if k in values] + \
+            [k for k in values if k not in AUTO_CTRLS]
+    errors = []
+    for name in order:
+        ok, err = set_control(device, name, values[name])
+        if not ok:
+            errors.append(f"{name}: {err}")
+    return errors
+
+
+def run_apply(device):
+    path = profile_path(device)
+    if not path.exists():
+        print(f"No saved profile at {path}", file=sys.stderr)
+        return 1
+    errors = apply_profile(device, json.loads(path.read_text()))
+    for e in errors:
+        print(e, file=sys.stderr)
+    return 1 if errors else 0
+
+
+def save_profile(device):
+    ctrls = list_controls(device)
+    values = {n: c["value"] for n, c in ctrls.items() if not c["inactive"]}
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    profile_path(device).write_text(json.dumps(values, indent=2))
+    return profile_path(device)
+
+
+def grouped_controls(device):
+    """Controls grouped for display, as consumed by the Omarchy panel."""
+    try:
+        info = subprocess.run(["v4l2-ctl", "-d", device, "--info"],
+                              capture_output=True, text=True, check=True).stdout
+        ctrls = list_controls(device)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {"present": False, "groups": []}
+    card = re.search(r"Card type\s*:\s*(.*)", info)
+    groups, seen = [], set()
+    for title, names in GROUPS + [("Other", list(ctrls))]:
+        items = []
+        for n in names:
+            if n not in ctrls or n in seen:
+                continue
+            seen.add(n)
+            c = dict(ctrls[n], label=pretty_label(n))
+            if c["type"] == "int" and (c["min"], c["max"]) == (0, 1):
+                c["type"] = "bool"  # on/off controls exposed as 0..1 ints
+            c["options"] = [{"value": str(k), "label": MENU_LABELS.get(v, v)}
+                            for k, v in c.pop("menu").items()]
+            items.append(c)
+        if items:
+            groups.append({"title": title, "controls": items})
+    return {"present": True, "card": card.group(1).strip() if card else device,
+            "hasProfile": profile_path(device).exists(), "groups": groups}
+
+
+# ---------------------------------------------------------------- GUI
+
+def run_gui(device):
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("Gst", "1.0")
+    gi.require_version("GstVideo", "1.0")
+    from gi.repository import Gdk, GLib, Gst, GstVideo, Gtk, Pango
+
+    Gst.init(None)
+
+    class Preview:
+        def __init__(self, picture, status_cb):
+            self.picture = picture
+            self.status_cb = status_cb
+            self.pipeline = None
+
+        def start(self):
+            desc = (f"v4l2src device={device} ! image/jpeg,width=1280,height=720 ! "
+                    "jpegdec ! videoconvert ! video/x-raw,format=RGBA ! "
+                    "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false")
+            self.pipeline = Gst.parse_launch(desc)
+            sink = self.pipeline.get_by_name("sink")
+            sink.connect("new-sample", self._on_sample)
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message::error", self._on_error)
+            self.pipeline.set_state(Gst.State.PLAYING)
+
+        def stop(self):
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline = None
+            self.picture.set_paintable(None)
+
+        def _on_sample(self, sink):
+            sample = sink.emit("pull-sample")
+            info = GstVideo.VideoInfo.new_from_caps(sample.get_caps())
+            buf = sample.get_buffer()
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if ok:
+                data = GLib.Bytes.new(mapinfo.data)
+                buf.unmap(mapinfo)
+                GLib.idle_add(self._show, data, info.width, info.height, info.stride[0])
+            return Gst.FlowReturn.OK
+
+        def _show(self, data, w, h, stride):
+            if self.pipeline:
+                tex = Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, data, stride)
+                self.picture.set_paintable(tex)
+            return False
+
+        def _on_error(self, _bus, msg):
+            err, _ = msg.parse_error()
+            self.stop()
+            self.status_cb(f"Preview stopped: {err.message} (camera in use by another app?)")
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Webcam Tuner")
+            self.set_default_size(1280, 720)
+            self.widgets = {}
+            self.pending = {}
+            self.updating = False
+
+            root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            self.set_child(root)
+
+            # Preview side
+            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            left.set_hexpand(True)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(left, f"set_margin_{side}")(10)
+            self.picture = Gtk.Picture()
+            self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+            self.picture.set_vexpand(True)
+            frame = Gtk.Frame()
+            frame.set_child(self.picture)
+            left.append(frame)
+            self.preview_btn = Gtk.ToggleButton(label="Preview")
+            self.preview_btn.set_active(True)
+            self.preview_btn.set_tooltip_text(
+                "Turn off to free the camera for other apps; settings stay applied.")
+            self.preview_btn.connect("toggled", self.on_preview_toggled)
+            self.status = Gtk.Label(xalign=0)
+            self.status.set_hexpand(True)
+            self.status.set_ellipsize(Pango.EllipsizeMode.END)
+            bar = Gtk.Box(spacing=8)
+            bar.append(self.preview_btn)
+            bar.append(self.status)
+            left.append(bar)
+            root.append(left)
+
+            # Controls side
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_size_request(400, -1)
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(right, f"set_margin_{side}")(12)
+            scroller.set_child(right)
+            root.append(scroller)
+
+            ctrls = list_controls(device)
+            seen = set()
+            for title, names in GROUPS + [("Other", [n for n in ctrls])]:
+                names = [n for n in names if n in ctrls and n not in seen]
+                if not names:
+                    continue
+                hdr = Gtk.Label(xalign=0)
+                hdr.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+                hdr.set_margin_top(10)
+                right.append(hdr)
+                for n in names:
+                    seen.add(n)
+                    right.append(self.build_row(ctrls[n]))
+
+            btns = Gtk.Box(spacing=6, homogeneous=True)
+            btns.set_margin_top(16)
+            for label, cb in (("Save profile", self.on_save),
+                              ("Load profile", self.on_load),
+                              ("Reset defaults", self.on_reset)):
+                b = Gtk.Button(label=label)
+                b.connect("clicked", cb)
+                btns.append(b)
+            right.append(btns)
+            hint = Gtk.Label(xalign=0, wrap=True)
+            hint.set_markup(
+                "<small>Cameras forget settings when unplugged. Run "
+                "<tt>webcam-tuner --apply</tt> to restore the saved profile.</small>")
+            hint.set_margin_top(6)
+            right.append(hint)
+
+            self.refresh()
+            self.preview = Preview(self.picture, self.set_status)
+            self.preview.start()
+            self.connect("close-request", lambda *_: self.preview.stop() or False)
+
+        def set_status(self, text):
+            self.status.set_text(text)
+
+        def build_row(self, c):
+            name = c["name"]
+            label = pretty_label(name)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            lbl = Gtk.Label(label=label, xalign=0)
+            if c["type"] == "bool":
+                row = Gtk.Box(spacing=8)
+                lbl.set_hexpand(True)
+                w = Gtk.Switch()
+                w.set_valign(Gtk.Align.CENTER)
+                w.connect("notify::active", lambda s, _p: self.queue_set(name, int(s.get_active())))
+                row.append(lbl)
+                row.append(w)
+                box.append(row)
+            elif c["type"] == "menu":
+                row = Gtk.Box(spacing=8)
+                lbl.set_hexpand(True)
+                keys = list(c["menu"].keys())
+                w = Gtk.DropDown.new_from_strings(
+                    [MENU_LABELS.get(v, v) for v in c["menu"].values()])
+                w.keys = keys
+                w.connect("notify::selected",
+                          lambda d, _p: self.queue_set(name, d.keys[d.get_selected()]))
+                row.append(lbl)
+                row.append(w)
+                box.append(row)
+            else:
+                box.append(lbl)
+                adj = Gtk.Adjustment(lower=c["min"], upper=c["max"],
+                                     step_increment=c["step"], page_increment=c["step"] * 10)
+                w = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
+                w.set_digits(0)
+                w.set_draw_value(True)
+                w.set_value_pos(Gtk.PositionType.RIGHT)
+                w.add_mark(c["default"], Gtk.PositionType.BOTTOM, None)
+                step = c["step"]
+                w.connect("value-changed", lambda s: self.queue_set(
+                    name, int(round(s.get_value() / step) * step)))
+                box.append(w)
+            box.set_margin_top(4)
+            self.widgets[name] = (box, w, c["type"])
+            return box
+
+        def queue_set(self, name, value):
+            if self.updating:
+                return
+            first = name not in self.pending
+            self.pending[name] = value
+            if first:
+                GLib.timeout_add(60, self.flush, name)
+
+        def flush(self, name):
+            value = self.pending.pop(name)
+            ok, err = set_control(device, name, value)
+            self.set_status(f"{name} = {value}" if ok else f"Failed: {err}")
+            self.refresh()
+            return False
+
+        def refresh(self):
+            ctrls = list_controls(device)
+            self.updating = True
+            for name, (box, w, typ) in self.widgets.items():
+                c = ctrls.get(name)
+                if not c:
+                    continue
+                if typ == "bool":
+                    w.set_active(bool(c["value"]))
+                elif typ == "menu":
+                    if c["value"] in w.keys:
+                        w.set_selected(w.keys.index(c["value"]))
+                else:
+                    w.set_value(c["value"])
+                box.set_sensitive(not c["inactive"])
+                box.set_tooltip_text("Disabled while the matching auto mode is on"
+                                     if c["inactive"] else None)
+            self.updating = False
+            return ctrls
+
+        def on_preview_toggled(self, btn):
+            if btn.get_active():
+                self.set_status("")
+                self.preview.start()
+            else:
+                self.preview.stop()
+                self.set_status("Preview off - camera is free for other apps")
+
+        def on_save(self, _b):
+            save_profile(device)
+            self.set_status(f"Saved to {profile_path(device)}")
+
+        def on_load(self, _b):
+            p = profile_path(device)
+            if not p.exists():
+                self.set_status("No saved profile yet")
+                return
+            errors = apply_profile(device, json.loads(p.read_text()))
+            self.refresh()
+            self.set_status("; ".join(errors) if errors else "Profile loaded")
+
+        def on_reset(self, _b):
+            ctrls = list_controls(device)
+            apply_profile(device, {n: c["default"] for n, c in ctrls.items()})
+            self.refresh()
+            self.set_status("Reset to camera defaults")
+
+    app = Gtk.Application(application_id="local.webcam.tuner")
+    app.connect("activate", lambda a: Window(a).present())
+    return app.run([sys.argv[0]])
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Webcam control tuner")
+    ap.add_argument("-d", "--device", default="/dev/video0")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true",
+                      help="apply saved profile and exit")
+    mode.add_argument("--save", action="store_true",
+                      help="save current camera settings as the profile")
+    mode.add_argument("--json", action="store_true",
+                      help="print controls as JSON")
+    args = ap.parse_args()
+    if args.json:
+        print(json.dumps(grouped_controls(args.device)))
+    elif args.save:
+        print(save_profile(args.device))
+    else:
+        sys.exit(run_apply(args.device) if args.apply else run_gui(args.device))
+
+
+if __name__ == "__main__":
+    main()

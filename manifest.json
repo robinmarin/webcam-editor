@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "badger.webcam",
+  "name": "Webcam",
+  "version": "1.0.0",
+  "author": "Robin Marin",
+  "license": "MIT",
+  "description": "Exposure, white balance, focus and image controls for UVC webcams, with saved profiles restored on login and replug",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Webcam",
+    "description": "Exposure, white balance, focus and image controls for UVC webcams",
+    "category": "System",
+    "aliases": ["webcam", "camera", "exposure"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "device": "/dev/video0"
+    },
+    "schema": [
+      {
+        "key": "device",
+        "type": "string",
+        "label": "Video device",
+        "defaultValue": "/dev/video0",
+        "description": "V4L2 device node of the camera (see `v4l2-ctl --list-devices`)."
+      }
+    ]
+  }
+}
